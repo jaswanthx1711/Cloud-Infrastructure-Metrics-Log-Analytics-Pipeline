@@ -1,0 +1,11 @@
+name: 'ecommerce_kpis'
+version: '1.0'
+config-version: 2
+profile: 'ecommerce_kpis'
+
+models:
+  ecommerce_kpis:
+    staging:
+      +materialized: view
+    marts:
+      +materialized: table

@@ -1,0 +1,7 @@
+ecommerce_kpis:
+  target: dev
+  outputs:
+    dev:
+      type: sqlite
+      threads: 1
+      database: "data/analytics.db"  # relative to repo root when running dbt from project dir

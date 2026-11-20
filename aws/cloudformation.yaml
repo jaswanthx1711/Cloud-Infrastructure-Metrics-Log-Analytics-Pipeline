@@ -1,0 +1,240 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Cloud Infrastructure Metrics & Log Analytics Pipeline (AWS)
+  Provisions: S3 buckets, Glue Catalog DB, Glue Crawlers, Glue Job,
+  Athena Workgroup, and IAM roles.
+
+# ── Parameters ──────────────────────────────────────────────────────────
+Parameters:
+  ProjectName:
+    Type: String
+    Default: cloud-metrics
+    Description: Prefix for all resource names
+
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+
+  GlueJobScriptPath:
+    Type: String
+    Description: S3 path to glue_job.py, e.g. s3://my-bucket/scripts/glue_job.py
+
+# ── Resources ────────────────────────────────────────────────────────────
+Resources:
+
+  # ─────────────────────────────────────────────────────────────────────
+  # S3 — Data Lake (3-zone: raw / silver / gold)
+  # ─────────────────────────────────────────────────────────────────────
+  DataLakeBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${ProjectName}-datalake-${Environment}-${AWS::AccountId}"
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: TransitionToIntelligentTiering
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: INTELLIGENT_TIERING
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  ScriptsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${ProjectName}-scripts-${Environment}-${AWS::AccountId}"
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  AthenaResultsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${ProjectName}-athena-results-${Environment}-${AWS::AccountId}"
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldResults
+            Status: Enabled
+            ExpirationInDays: 7
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ─────────────────────────────────────────────────────────────────────
+  # IAM — Glue Service Role
+  # ─────────────────────────────────────────────────────────────────────
+  GlueServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-glue-role-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+      Policies:
+        - PolicyName: GlueS3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt DataLakeBucket.Arn
+                  - !Sub "${DataLakeBucket.Arn}/*"
+                  - !GetAtt ScriptsBucket.Arn
+                  - !Sub "${ScriptsBucket.Arn}/*"
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws-glue/*"
+
+  # ─────────────────────────────────────────────────────────────────────
+  # Glue Catalog Database
+  # ─────────────────────────────────────────────────────────────────────
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Sub "${ProjectName}_${Environment}"
+        Description: Cloud Metrics Analytics — Bronze / Silver / Gold layers
+
+  # ─────────────────────────────────────────────────────────────────────
+  # Glue Crawlers — one per data zone
+  # ─────────────────────────────────────────────────────────────────────
+  BronzeCrawler:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: !Sub "${ProjectName}-bronze-crawler-${Environment}"
+      Role: !GetAtt GlueServiceRole.Arn
+      DatabaseName: !Ref GlueDatabase
+      Targets:
+        S3Targets:
+          - Path: !Sub "s3://${DataLakeBucket}/raw/"
+      TablePrefix: bronze_
+      SchemaChangePolicy:
+        UpdateBehavior: UPDATE_IN_DATABASE
+        DeleteBehavior: LOG
+      Schedule:
+        ScheduleExpression: "cron(0 6 * * ? *)"   # Daily at 06:00 UTC
+
+  SilverCrawler:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: !Sub "${ProjectName}-silver-crawler-${Environment}"
+      Role: !GetAtt GlueServiceRole.Arn
+      DatabaseName: !Ref GlueDatabase
+      Targets:
+        S3Targets:
+          - Path: !Sub "s3://${DataLakeBucket}/silver/"
+      TablePrefix: stg_
+      SchemaChangePolicy:
+        UpdateBehavior: UPDATE_IN_DATABASE
+        DeleteBehavior: LOG
+
+  GoldCrawler:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: !Sub "${ProjectName}-gold-crawler-${Environment}"
+      Role: !GetAtt GlueServiceRole.Arn
+      DatabaseName: !Ref GlueDatabase
+      Targets:
+        S3Targets:
+          - Path: !Sub "s3://${DataLakeBucket}/gold/"
+      TablePrefix: ""
+      SchemaChangePolicy:
+        UpdateBehavior: UPDATE_IN_DATABASE
+        DeleteBehavior: LOG
+
+  # ─────────────────────────────────────────────────────────────────────
+  # Glue ETL Job
+  # ─────────────────────────────────────────────────────────────────────
+  GlueETLJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: !Sub "${ProjectName}-etl-job-${Environment}"
+      Role: !GetAtt GlueServiceRole.Arn
+      Description: Cloud Metrics ETL — Bronze to Silver to Gold transformations
+      GlueVersion: "3.0"
+      WorkerType: G.1X
+      NumberOfWorkers: 2
+      Timeout: 60
+      Command:
+        Name: glueetl
+        ScriptLocation: !Ref GlueJobScriptPath
+        PythonVersion: "3"
+      DefaultArguments:
+        "--job-bookmark-option":  "job-bookmark-enable"
+        "--enable-metrics":       "true"
+        "--enable-spark-ui":      "true"
+        "--S3_BUCKET":            !Ref DataLakeBucket
+        "--DATABASE_NAME":        !Ref GlueDatabase
+        "--AWS_REGION":           !Ref AWS::Region
+      ExecutionProperty:
+        MaxConcurrentRuns: 1
+      Tags:
+        Project: !Ref ProjectName
+
+  # ─────────────────────────────────────────────────────────────────────
+  # Athena Workgroup
+  # ─────────────────────────────────────────────────────────────────────
+  AthenaWorkgroup:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: !Sub "${ProjectName}-${Environment}"
+      Description: Cloud Metrics analytics queries
+      WorkGroupConfiguration:
+        ResultConfiguration:
+          OutputLocation: !Sub "s3://${AthenaResultsBucket}/results/"
+          EncryptionConfiguration:
+            EncryptionOption: SSE_S3
+        EnforceWorkGroupConfiguration: true
+        PublishCloudWatchMetricsEnabled: true
+        BytesScannedCutoffPerQuery: 10737418240   # 10 GB limit per query
+
+# ── Outputs ──────────────────────────────────────────────────────────────
+Outputs:
+  DataLakeBucket:
+    Description: Main S3 data lake bucket
+    Value: !Ref DataLakeBucket
+    Export:
+      Name: !Sub "${ProjectName}-datalake-bucket-${Environment}"
+
+  GlueDatabase:
+    Description: Glue Catalog database name
+    Value: !Ref GlueDatabase
+    Export:
+      Name: !Sub "${ProjectName}-glue-db-${Environment}"
+
+  GlueJobName:
+    Description: Name of the Glue ETL job
+    Value: !Ref GlueETLJob
+
+  AthenaWorkgroup:
+    Description: Athena workgroup for analytics queries
+    Value: !Ref AthenaWorkgroup
+
+  AthenaResultsLocation:
+    Description: S3 location for Athena query results
+    Value: !Sub "s3://${AthenaResultsBucket}/results/"

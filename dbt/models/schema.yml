@@ -1,0 +1,26 @@
+version: 2
+
+sources:
+  - name: bronze
+    tables:
+      - name: raw_users
+      - name: raw_user_events
+      - name: raw_sales
+      - name: raw_marketing
+
+models:
+  - name: stg_users
+    description: "Staging users (cleaned)"
+    columns:
+      - name: user_id
+        tests: [not_null, unique]
+      - name: email
+        tests: [not_null]
+  - name: stg_sales
+    columns:
+      - name: order_id
+        tests: [not_null]
+  - name: fct_orders
+    columns:
+      - name: order_id
+        tests: [not_null]

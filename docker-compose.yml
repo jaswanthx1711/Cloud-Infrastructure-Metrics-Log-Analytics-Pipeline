@@ -1,0 +1,19 @@
+services:
+  etl:
+    build: .
+    container_name: cloud_metrics_etl
+    command: python etl/pipeline.py
+    volumes:
+      - ./data:/app/data
+
+  dashboard:
+    build: .
+    container_name: cloud_metrics_dashboard
+    command: streamlit run dashboard/kpi_dashboard.py --server.port=8509 --server.address=0.0.0.0
+    ports:
+      - "8509:8509"
+    volumes:
+      - ./data:/app/data
+    depends_on:
+      etl:
+        condition: service_completed_successfully
